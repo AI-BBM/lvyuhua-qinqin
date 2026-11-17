@@ -1,0 +1,118 @@
+const fs = require('fs');
+const path = require('path');
+const { getOrClaimSession, getOrCreateWorkspaceId } = require('./session_registry.js');
+
+const LOG_FILE = 'C:/Users/hxx/.gemini/config/scripts/hook_debug.log';
+function logDebug(msg) {
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`, 'utf-8');
+  } catch {}
+}
+
+(async () => {
+  logDebug('auto_wake_on_stop invoked');
+  try {
+    const raw = fs.readFileSync(0, 'utf-8');
+    logDebug(`stdin raw length=${raw ? raw.length : 0}`);
+    if (!raw || !raw.trim()) {
+      logDebug('empty stdin -> exit 0');
+      console.log(JSON.stringify({}));
+      process.exit(0);
+    }
+
+    const input = JSON.parse(raw);
+    logDebug(`input: terminationReason=${input.terminationReason}, fullyIdle=${input.fullyIdle}, executionNum=${input.executionNum}, convId=${input.conversationId}`);
+
+    // Antigravity 实际发送的 terminationReason 包含 NO_TOOL_CALL, model_stop, MODEL_STOP 等
+    const validNormalStops = new Set(['model_stop', 'MODEL_STOP', 'NO_TOOL_CALL', 'STOP', 'END_TURN', '']);
+    if (input.terminationReason && !validNormalStops.has(input.terminationReason)) {
+      logDebug(`terminationReason is ${input.terminationReason} (error/abnormal termination) -> exit 0`);
+      console.log(JSON.stringify({}));
+      process.exit(0);
+    }
+
+    // Prevent infinite loop if already reminded in this execution cycle
+    if (input.executionNum && input.executionNum > 2) {
+      logDebug(`executionNum is ${input.executionNum} (>2) -> exit 0`);
+      console.log(JSON.stringify({}));
+      process.exit(0);
+    }
+
+    const workspace = (input.workspacePaths && input.workspacePaths[0]) || process.cwd();
+    const wsId = getOrCreateWorkspaceId(workspace);
+
+    // 解析当前会话绑定的专属 ID（核心原则：会话不变编号不变）
+    const convId = input.conversationId || '';
+    const session = getOrClaimSession(convId, 'antigravity', 'gemini', wsId);
+    const targetId = process.env.AGENT_TEAMS_ID || session.id;
+
+    const BASE = process.env.AGENT_TEAMS_URL || 'https://teams.aibbm.cn';
+    let apiKey = process.env.AGENT_TEAMS_API_KEY || '';
+    if (!apiKey) {
+      const keyFiles = [
+        path.join(require('os').homedir(), '.agent-teams-key'),
+        path.join('D:/agent-teams', '.agent-teams-key'),
+        path.join('D:/agent-teams', 'data', 'api.key'),
+      ];
+      for (const keyFile of keyFiles) {
+        try {
+          if (fs.existsSync(keyFile)) {
+            apiKey = fs.readFileSync(keyFile, 'utf-8').trim();
+            if (apiKey) break;
+          }
+        } catch {}
+      }
+    }
+
+    logDebug(`targetId=${targetId}, wsId=${wsId}, hasApiKey=${Boolean(apiKey)}`);
+
+    // Check if agent-teams server is running
+    try {
+      const health = await fetch(BASE + '/health', { signal: AbortSignal.timeout(1500) });
+      if (!health.ok) {
+        logDebug(`health check returned ${health.status} -> exit 0`);
+        console.log(JSON.stringify({}));
+        process.exit(0);
+      }
+
+      // Check if this session's wake is already connected
+      try {
+        const statusUrl = `${BASE}/wake/status?id=${encodeURIComponent(targetId)}&workspace=${encodeURIComponent(wsId)}` + (apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : '');
+        const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
+        const stRes = await fetch(statusUrl, { headers, signal: AbortSignal.timeout(1500) });
+        if (stRes.ok) {
+          const st = await stRes.json();
+          logDebug(`wake status response: wait_connected=${st ? st.wait_connected : 'null'}`);
+          if (st && st.wait_connected) {
+            logDebug('wake is ALREADY connected -> exit 0');
+            console.log(JSON.stringify({}));
+            process.exit(0);
+          }
+        } else {
+          logDebug(`wake status returned ${stRes.status}`);
+        }
+      } catch (stErr) {
+        logDebug(`wake status fetch error: ${stErr.message}`);
+      }
+    } catch (healthErr) {
+      logDebug(`server health check error: ${healthErr.message} -> exit 0`);
+      console.log(JSON.stringify({}));
+      process.exit(0);
+    }
+
+    const keyParam = apiKey ? ` --api-key ${apiKey}` : '';
+    const reason = `【agent-teams 待机唤醒保障】当前会话（${session.name} #${session.num}，项目: ${wsId}，专属 ID: ${targetId}）尚未启动唤醒监听后台任务。\n` +
+      `请使用 run_command 启动后台长轮询任务：\n` +
+      `& D:\\agent-teams\\agent-teams.exe wake --id ${targetId} --workspace "${wsId}" --ide antigravity${keyParam}\n` +
+      `（注意将 WaitMsBeforeAsync 设为 500ms 使其进入后台），挂起后即可结束本轮调用进入待机。`;
+
+    logDebug('EMITTING continue decision with wake prompt!');
+    console.log(JSON.stringify({
+      decision: "continue",
+      reason: reason
+    }));
+  } catch (err) {
+    logDebug(`unexpected outer error: ${err.message}\n${err.stack}`);
+    console.log(JSON.stringify({}));
+  }
+})();
